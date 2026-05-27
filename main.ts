@@ -42,43 +42,29 @@ function generateId(): string {
  *  COMPLETE TRAFFIC INTERCEPTION ARCHITECTURE
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *
- * Obsidian runs on Electron (Chromium + Node.js). Network requests
- * can originate from two distinct stacks:
+ * Three critical layers for proxy to work on ALL Obsidian + plugin traffic:
  *
- *  1) CHROMIUM NETWORK STACK (renderer process)
- *     - fetch(), XMLHttpRequest, <img src>, <link>, webview, etc.
- *     - Obsidian's requestUrl() (uses electron.net under the hood)
- *     - ALL community plugins that use requestUrl()
- *     → Controlled by session.setProxy()
+ *  A) session.setProxy() with mode: 'fixed_servers'
+ *     - Applied to EVERY Electron session we can find
+ *     - Covers Chromium network stack (fetch, XHR, requestUrl, webviews)
+ *     - Credentials embedded in proxyRules URL (http://user:pass@host:port)
  *
- *  2) NODE.JS NETWORK STACK (main process)
- *     - require('http').request(), require('https').request()
- *     - Some plugins that use Node.js http directly
- *     - Obsidian Sync (partially)
- *     → NOT controlled by session.setProxy()
- *     → Controlled by process.env HTTP_PROXY / HTTPS_PROXY
- *       (read by many popular libraries: axios, node-fetch, got)
+ *  B) session.on('login') handler
+ *     - When proxy sends 407 Proxy Auth Required, Chromium fires
+ *       the 'login' event. Without a handler, Chromium silently
+ *       drops the connection or shows an invisible dialog.
+ *     - Our handler checks authInfo.isProxy and provides credentials.
+ *     - This is ESSENTIAL for proxy auth to work reliably.
  *
- * This plugin applies proxy rules at BOTH levels to ensure
- * complete coverage:
+ *  C) process.env variables
+ *     - HTTP_PROXY, HTTPS_PROXY, ALL_PROXY (+ lowercase)
+ *     - Covers Node.js stack: axios, node-fetch, got, etc.
+ *     - For SOCKS5: only ALL_PROXY uses socks5:// scheme
+ *       (HTTP_PROXY with socks5:// confuses most libraries)
  *
- *  A) Electron session.setProxy() — with mode: 'fixed_servers'
- *     Applied to ALL discoverable sessions:
- *       - defaultSession
- *       - Current BrowserWindow's webContents.session
- *       - All open BrowserWindows
- *       - Common partitions (persist:obsidian, persist:sync, etc.)
+ *  D) Periodic refresh every 30s — catches new BrowserWindows
  *
- *  B) process.env variables:
- *       HTTP_PROXY, HTTPS_PROXY, ALL_PROXY
- *       http_proxy, https_proxy, all_proxy
- *
- *  C) Periodic refresh every 30s — re-applies proxy to all
- *     sessions, catching any new BrowserWindows/webviews
- *     created after proxy was enabled.
- *
- *  D) Verification via session.resolveProxy() — confirms
- *     the proxy rules were actually accepted by Chromium.
+ *  E) Verification via session.resolveProxy() after setProxy
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  */
 export default class ObsiProxyPlugin extends Plugin {
@@ -86,6 +72,7 @@ export default class ObsiProxyPlugin extends Plugin {
 	private sessionWatchInterval: number | null = null;
 	private originalEnv: Map<string, string | undefined> = new Map();
 	private lastSessionCount: number = 0;
+	private loginHandler: ((...args: any[]) => void) | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -125,12 +112,6 @@ export default class ObsiProxyPlugin extends Plugin {
 	//  SESSION DISCOVERY
 	// ──────────────────────────────────────────────────────────
 
-	/**
-	 * Get the Electron remote module through any available method.
-	 * In Electron 17+, electron.remote was removed and replaced
-	 * by the @electron/remote package. Obsidian may or may not
-	 * have it available, so we try both.
-	 */
 	private getRemote(): any {
 		try {
 			const electron = (window as any).require("electron");
@@ -144,19 +125,11 @@ export default class ObsiProxyPlugin extends Plugin {
 	}
 
 	/**
-	 * Discover ALL Electron sessions in the current Obsidian instance.
+	 * Discover ALL Electron sessions.
 	 *
-	 * This is critical for complete coverage. A single call to
-	 * session.defaultSession.setProxy() is NOT sufficient because:
-	 *
-	 *   - Obsidian may use separate partitions for Sync, plugin
-	 *     downloads, webviews, etc.
-	 *   - Each BrowserWindow has its own webContents with its own session.
-	 *   - New windows created by plugins get new sessions that
-	 *     don't inherit defaultSession's proxy settings.
-	 *
-	 * We cast everything to `any` because the Electron API surface
-	 * varies between versions and we need maximum compatibility.
+	 * Critical: Obsidian uses separate sessions for Sync, plugin
+	 * downloads, webviews, etc. Applying proxy only to defaultSession
+	 * is NOT enough — other sessions bypass the proxy entirely.
 	 */
 	async getAllSessions(): Promise<ElectronSession[]> {
 		const sessions: ElectronSession[] = [];
@@ -174,29 +147,20 @@ export default class ObsiProxyPlugin extends Plugin {
 			const remote = this.getRemote();
 
 			if (remote) {
-				// 1. defaultSession — the primary session
-				try {
-					add(remote.session?.defaultSession);
-				} catch {}
+				try { add(remote.session?.defaultSession); } catch {}
 
-				// 2. Current window's session — most directly relevant
 				try {
 					const win = remote.getCurrentWindow();
 					add(win?.webContents?.session);
 				} catch {}
 
-				// 3. ALL BrowserWindows — popout windows, secondary windows
 				try {
 					const windows: any[] = remote.BrowserWindow.getAllWindows();
 					for (const win of windows) {
-						try {
-							add(win.webContents?.session);
-						} catch {}
+						try { add(win.webContents?.session); } catch {}
 					}
 				} catch {}
 
-				// 4. Common partition-based sessions
-				//    Obsidian may use these for Sync, plugin downloads, etc.
 				const partitions = [
 					"persist:obsidian",
 					"persist:sync",
@@ -208,16 +172,11 @@ export default class ObsiProxyPlugin extends Plugin {
 					"persist:",
 				];
 				for (const partition of partitions) {
-					try {
-						add(remote.session?.fromPartition?.(partition));
-					} catch {}
+					try { add(remote.session?.fromPartition?.(partition)); } catch {}
 				}
 			}
 
-			// 5. electron.session directly (may work in some contexts)
-			try {
-				add(electron.session?.defaultSession);
-			} catch {}
+			try { add(electron.session?.defaultSession); } catch {}
 		} catch {}
 
 		this.lastSessionCount = sessions.length;
@@ -231,11 +190,32 @@ export default class ObsiProxyPlugin extends Plugin {
 	/**
 	 * Build Chromium-compatible proxyRules string.
 	 *
-	 * Chromium proxy configuration format:
-	 *   https://www.chromium.org/developers/design-documents/network-settings/
+	 * ─── CRITICAL FORMAT NOTE ───
 	 *
-	 * HTTP:  "http=user:pass@host:port;https=user:pass@host:port"
-	 * SOCKS5: "socks5://user:pass@host:port"
+	 * When credentials are present, the proxy URL MUST include the
+	 * scheme prefix (http://) explicitly. Without it, Chromium's
+	 * parser misinterprets the string:
+	 *
+	 *   WRONG: "http=user:pass@host:port"
+	 *     → Chromium sees "http=" as traffic type, then tries to
+	 *       parse "user:pass@host:port" as host:port
+	 *     → Result: host="user", port="pass@host..." → GARBAGE
+	 *
+	 *   CORRECT: "http=http://user:pass@host:port"
+	 *     → Chromium sees "http=" as traffic type, then parses
+	 *       "http://user:pass@host:port" as a URL with scheme
+	 *     → Result: correct extraction of user, pass, host, port
+	 *
+	 * Chromium proxy config format:
+	 *   proxy-rule = [ traffic-type "=" ] [ scheme "://" ] [ user ":" pass "@" ] host [ ":" port ]
+	 *   traffic-type = "http" | "https" | "ftp"
+	 *   scheme = "http" | "https" | "socks4" | "socks5" | "direct"
+	 *
+	 * Example for HTTP proxy with auth:
+	 *   "http=http://user:pass@host:port;https=http://user:pass@host:port"
+	 *
+	 * Example for SOCKS5 proxy with auth:
+	 *   "socks5://user:pass@host:port"
 	 */
 	buildProxyRules(proxy: ProxyEntry): string {
 		const { proxyType, host, port, username, password } = proxy;
@@ -250,23 +230,77 @@ export default class ObsiProxyPlugin extends Plugin {
 			return `socks5://${auth}${host}:${port}`;
 		}
 
-		return `http=${auth}${host}:${port};https=${auth}${host}:${port}`;
+		if (username && password) {
+			return `http=http://${auth}${host}:${port};https=http://${auth}${host}:${port}`;
+		}
+
+		return `http=${host}:${port};https=${host}:${port}`;
+	}
+
+	// ──────────────────────────────────────────────────────────
+	//  LOGIN HANDLER (PROXY AUTH)
+	// ──────────────────────────────────────────────────────────
+
+	/**
+	 * Create a login handler for session.on('login').
+	 *
+	 * When a proxy sends 407 Proxy Authentication Required,
+	 * Chromium fires the 'login' event. Without a handler:
+	 *   - Chromium shows an invisible auth dialog in Electron
+	 *   - The request silently fails
+	 *   - The user sees "connection error" with no explanation
+	 *
+	 * With this handler:
+	 *   - We detect authInfo.isProxy (proxy auth challenge)
+	 *   - We provide the username/password via callback()
+	 *   - The proxy connection succeeds
+	 *
+	 * This is ESSENTIAL for proxies that require authentication.
+	 * Even if credentials are in proxyRules, Chromium may still
+	 * fire the 'login' event in some cases.
+	 */
+	private createLoginHandler(proxy: ProxyEntry): (...args: any[]) => void {
+		return (
+			event: any,
+			_webContents: any,
+			_request: any,
+			authInfo: any,
+			callback: any
+		) => {
+			if (authInfo?.isProxy && proxy.username && proxy.password) {
+				event.preventDefault();
+				callback(proxy.username, proxy.password);
+			}
+		};
 	}
 
 	/**
-	 * Build a standard proxy URL for environment variables.
-	 * Format: "http://user:pass@host:port" or "socks5://user:pass@host:port"
+	 * Register login handler on all discovered sessions.
+	 * Remove old handler first to prevent duplicates.
 	 */
-	buildProxyUrl(proxy: ProxyEntry): string {
-		const auth =
-			proxy.username && proxy.password
-				? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`
-				: "";
-
-		if (proxy.proxyType === "socks5") {
-			return `socks5://${auth}${proxy.host}:${proxy.port}`;
+	private async registerLoginHandlers(proxy: ProxyEntry): Promise<void> {
+		await this.unregisterLoginHandlers();
+		this.loginHandler = this.createLoginHandler(proxy);
+		const sessions = await this.getAllSessions();
+		for (const session of sessions) {
+			try {
+				session.on("login", this.loginHandler);
+			} catch {}
 		}
-		return `http://${auth}${proxy.host}:${proxy.port}`;
+	}
+
+	/**
+	 * Remove login handler from all sessions.
+	 */
+	private async unregisterLoginHandlers(): Promise<void> {
+		if (!this.loginHandler) return;
+		const sessions = await this.getAllSessions();
+		for (const session of sessions) {
+			try {
+				session.removeListener("login", this.loginHandler);
+			} catch {}
+		}
+		this.loginHandler = null;
 	}
 
 	// ──────────────────────────────────────────────────────────
@@ -276,17 +310,37 @@ export default class ObsiProxyPlugin extends Plugin {
 	/**
 	 * Set process.env proxy variables.
 	 *
-	 * Many Node.js HTTP libraries (axios, node-fetch, got, request)
-	 * read HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from environment.
-	 * The Node.js built-in http/https modules do NOT read these,
-	 * but setting them covers a significant portion of real-world usage.
+	 * For HTTP proxy:
+	 *   HTTP_PROXY=http://user:pass@host:port
+	 *   HTTPS_PROXY=http://user:pass@host:port
+	 *   ALL_PROXY=http://user:pass@host:port
 	 *
-	 * We also set lowercase variants (http_proxy) because some
-	 * tools only check the lowercase version.
+	 * For SOCKS5 proxy:
+	 *   HTTP_PROXY=socks5://user:pass@host:port  (for libs that support it)
+	 *   HTTPS_PROXY=socks5://user:pass@host:port
+	 *   ALL_PROXY=socks5://user:pass@host:port
+	 *
+	 * Note: Most HTTP libraries (axios, node-fetch) only understand
+	 * http:// scheme in HTTP_PROXY. For SOCKS5, they need
+	 * socks-proxy-agent or similar. ALL_PROXY with socks5:// is
+	 * the standard fallback for SOCKS5-aware libraries (got, etc.)
 	 */
 	setEnvironmentProxy(proxy: ProxyEntry) {
-		const httpUrl = `http://${proxy.username && proxy.password ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@` : ""}${proxy.host}:${proxy.port}`;
-		const allUrl = this.buildProxyUrl(proxy);
+		const auth =
+			proxy.username && proxy.password
+				? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`
+				: "";
+
+		let httpUrl: string;
+		let allUrl: string;
+
+		if (proxy.proxyType === "socks5") {
+			httpUrl = `socks5://${auth}${proxy.host}:${proxy.port}`;
+			allUrl = `socks5://${auth}${proxy.host}:${proxy.port}`;
+		} else {
+			httpUrl = `http://${auth}${proxy.host}:${proxy.port}`;
+			allUrl = `http://${auth}${proxy.host}:${proxy.port}`;
+		}
 
 		const keys = [
 			"HTTP_PROXY",
@@ -311,9 +365,6 @@ export default class ObsiProxyPlugin extends Plugin {
 		process.env.all_proxy = allUrl;
 	}
 
-	/**
-	 * Restore original environment variables.
-	 */
 	clearEnvironmentProxy() {
 		const keys = [
 			"HTTP_PROXY",
@@ -340,18 +391,12 @@ export default class ObsiProxyPlugin extends Plugin {
 	// ──────────────────────────────────────────────────────────
 
 	/**
-	 * Apply proxy to ALL discovered sessions + environment variables.
+	 * Apply proxy to ALL discovered sessions + env vars + login handler.
 	 *
-	 * This is the core method that ensures complete traffic coverage.
-	 * It applies the proxy at two levels:
-	 *
-	 *   1) session.setProxy() — Chromium network stack
-	 *      Covers: fetch, XHR, requestUrl(), electron.net,
-	 *              webviews, plugin API calls, Obsidian Sync
-	 *
-	 *   2) process.env — Node.js network stack fallback
-	 *      Covers: axios, node-fetch, got, and any library
-	 *              that reads HTTP_PROXY/HTTPS_PROXY
+	 * Three-layer approach:
+	 *   1) session.setProxy({ mode: 'fixed_servers', proxyRules })
+	 *   2) session.on('login', handler) — for 407 proxy auth
+	 *   3) process.env — for Node.js stack
 	 */
 	async applyProxy(): Promise<boolean> {
 		const proxy = this.getActiveProxy();
@@ -366,7 +411,7 @@ export default class ObsiProxyPlugin extends Plugin {
 			return false;
 		}
 
-		// ── Level 1: Electron sessions ──
+		// ── Layer 1: setProxy on all sessions ──
 		const sessions = await this.getAllSessions();
 		let applied = 0;
 
@@ -383,18 +428,20 @@ export default class ObsiProxyPlugin extends Plugin {
 			}
 		}
 
-		// ── Level 2: Environment variables ──
+		// ── Layer 2: login handler for proxy auth ──
+		await this.registerLoginHandlers(proxy);
+
+		// ── Layer 3: environment variables ──
 		this.setEnvironmentProxy(proxy);
 
 		// ── Verification ──
 		if (applied === 0) {
 			new Notice(
-				"Obsi Proxy: could not apply proxy to any Electron session. Check Electron API access."
+				"Obsi Proxy: could not apply proxy to any Electron session. Run Diagnostics for details."
 			);
 			return false;
 		}
 
-		// Verify at least one session accepted the proxy
 		let verified = false;
 		for (const session of sessions) {
 			try {
@@ -415,19 +462,22 @@ export default class ObsiProxyPlugin extends Plugin {
 		}
 
 		console.log(
-			`Obsi Proxy: applied to ${applied}/${sessions.length} sessions, env vars set, verified=${verified}`
+			`Obsi Proxy: applied to ${applied}/${sessions.length} sessions, login handler registered, env vars set, verified=${verified}`
 		);
+		console.log(`Obsi Proxy: proxyRules = "${rules}"`);
 
 		new Notice(
-			`Obsi Proxy: ON — ${proxy.name} (${applied} sessions, env vars set)`
+			`Obsi Proxy: ON — ${proxy.name} (${applied} sessions${verified ? ", verified" : ""})`
 		);
 		return true;
 	}
 
 	/**
-	 * Clear proxy from ALL sessions + restore environment variables.
+	 * Clear proxy from ALL sessions + restore env + remove login handler.
 	 */
 	async clearProxy(): Promise<void> {
+		await this.unregisterLoginHandlers();
+
 		const sessions = await this.getAllSessions();
 		for (const session of sessions) {
 			try {
@@ -465,13 +515,7 @@ export default class ObsiProxyPlugin extends Plugin {
 	// ──────────────────────────────────────────────────────────
 
 	/**
-	 * Periodically re-apply proxy to all sessions.
-	 *
-	 * This handles the case where new BrowserWindows or webviews
-	 * are created AFTER the proxy was enabled. These new sessions
-	 * don't inherit the proxy settings from defaultSession.
-	 *
-	 * Interval: 30 seconds (low overhead, catches new windows quickly).
+	 * Re-apply proxy + login handler every 30s to catch new sessions.
 	 */
 	startSessionWatch() {
 		if (this.sessionWatchInterval) return;
@@ -491,6 +535,13 @@ export default class ObsiProxyPlugin extends Plugin {
 						proxyBypassRules: "",
 					});
 				} catch {}
+
+				if (this.loginHandler) {
+					try {
+						session.removeListener("login", this.loginHandler);
+						session.on("login", this.loginHandler);
+					} catch {}
+				}
 			}
 		}, 30000);
 	}
@@ -507,17 +558,12 @@ export default class ObsiProxyPlugin extends Plugin {
 	// ──────────────────────────────────────────────────────────
 
 	/**
-	 * Check if a proxy works by making a test request through it.
-	 *
-	 * Works regardless of whether the proxy is currently active:
-	 *
-	 *   - If the proxy IS active: just make the test request directly.
-	 *   - If the proxy is NOT active: temporarily apply it to ALL
-	 *     sessions + env vars, make the test request, then revert
-	 *     to the previous state.
-	 *
-	 * This ensures the checker is useful for pre-flight testing
-	 * before committing to a proxy.
+	 * Check proxy by making a test request.
+	 * Works even when proxy is NOT currently active:
+	 *   1. Temporarily apply proxy to ALL sessions + env vars
+	 *   2. Wait 500ms for Chromium to update proxy config
+	 *   3. Make test request to ipify.org
+	 *   4. Revert to previous state
 	 */
 	async checkConnection(proxy: ProxyEntry): Promise<{
 		ip: string;
@@ -532,7 +578,6 @@ export default class ObsiProxyPlugin extends Plugin {
 			const rules = this.buildProxyRules(proxy);
 			if (!rules) return null;
 
-			// Temporarily apply to ALL sessions
 			const sessions = await this.getAllSessions();
 			for (const session of sessions) {
 				try {
@@ -543,8 +588,18 @@ export default class ObsiProxyPlugin extends Plugin {
 					});
 				} catch {}
 			}
+
+			if (proxy.username && proxy.password) {
+				const handler = this.createLoginHandler(proxy);
+				for (const session of sessions) {
+					try { session.on("login", handler); } catch {}
+				}
+			}
+
 			this.setEnvironmentProxy(proxy);
 			needsRevert = true;
+
+			await new Promise((resolve) => setTimeout(resolve, 500));
 		}
 
 		try {
@@ -558,20 +613,20 @@ export default class ObsiProxyPlugin extends Plugin {
 			return null;
 		} finally {
 			if (needsRevert) {
-				// Revert to previous state
 				if (this.settings.enabled && this.getActiveProxy()) {
 					const activeProxy = this.getActiveProxy()!;
-					const rules = this.buildProxyRules(activeProxy);
+					const activeRules = this.buildProxyRules(activeProxy);
 					const sessions = await this.getAllSessions();
 					for (const session of sessions) {
 						try {
 							await session.setProxy({
 								mode: "fixed_servers",
-								proxyRules: rules,
+								proxyRules: activeRules,
 								proxyBypassRules: "",
 							});
 						} catch {}
 					}
+					await this.registerLoginHandlers(activeProxy);
 					this.setEnvironmentProxy(activeProxy);
 				} else {
 					const sessions = await this.getAllSessions();
@@ -584,6 +639,7 @@ export default class ObsiProxyPlugin extends Plugin {
 							});
 						} catch {}
 					}
+					await this.unregisterLoginHandlers();
 					this.clearEnvironmentProxy();
 				}
 			}
@@ -594,17 +650,12 @@ export default class ObsiProxyPlugin extends Plugin {
 	//  DIAGNOSTICS
 	// ──────────────────────────────────────────────────────────
 
-	/**
-	 * Collect diagnostic information about the current proxy state.
-	 * Useful for debugging and user support.
-	 */
 	async getDiagnostics(): Promise<string> {
 		const lines: string[] = [];
 
 		lines.push("=== Obsi Proxy Diagnostics ===");
 		lines.push("");
 
-		// Electron access
 		const hasRequire = typeof (window as any).require === "function";
 		lines.push(`window.require available: ${hasRequire}`);
 
@@ -624,7 +675,6 @@ export default class ObsiProxyPlugin extends Plugin {
 			}
 		}
 
-		// Sessions
 		const sessions = await this.getAllSessions();
 		lines.push(`Sessions discovered: ${sessions.length}`);
 
@@ -640,7 +690,6 @@ export default class ObsiProxyPlugin extends Plugin {
 			}
 		}
 
-		// Environment variables
 		lines.push("");
 		lines.push("Environment variables:");
 		for (const key of [
@@ -660,12 +709,24 @@ export default class ObsiProxyPlugin extends Plugin {
 			}
 		}
 
-		// Plugin state
 		lines.push("");
 		lines.push(`Proxy enabled: ${this.settings.enabled}`);
 		lines.push(`Active proxy ID: ${this.settings.activeProxyId || "(none)"}`);
 		lines.push(`Saved proxies: ${this.settings.proxies.length}`);
 		lines.push(`Session watch active: ${this.sessionWatchInterval !== null}`);
+		lines.push(`Login handler registered: ${this.loginHandler !== null}`);
+
+		const active = this.getActiveProxy();
+		if (active) {
+			lines.push("");
+			lines.push("Active proxy details:");
+			lines.push(`  Name: ${active.name}`);
+			lines.push(`  Type: ${active.proxyType}`);
+			lines.push(`  Host: ${active.host}`);
+			lines.push(`  Port: ${active.port}`);
+			lines.push(`  Has auth: ${!!(active.username && active.password)}`);
+			lines.push(`  proxyRules: "${this.buildProxyRules(active)}"`);
+		}
 
 		return lines.join("\n");
 	}
@@ -795,7 +856,7 @@ class ProxyEditModal extends Modal {
 		new Setting(contentEl)
 			.setName("Proxy type")
 			.setDesc(
-				"HTTP routes HTTP/HTTPS. SOCKS5 proxies all TCP with DNS resolution on the proxy side."
+				"HTTP routes HTTP/HTTPS traffic through HTTP CONNECT. SOCKS5 proxies all TCP with DNS on the proxy side."
 			)
 			.addDropdown((dd) =>
 				dd
@@ -809,10 +870,10 @@ class ProxyEditModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Host")
-			.setDesc("IP address or hostname")
+			.setDesc("IP address or hostname of the proxy server")
 			.addText((text) =>
 				text
-					.setPlaceholder("e.g. 127.0.0.1")
+					.setPlaceholder("e.g. 167.148.96.23")
 					.setValue(this.entry.host)
 					.onChange((val) => {
 						this.entry.host = val.trim();
@@ -821,10 +882,10 @@ class ProxyEditModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Port")
-			.setDesc("Port number")
+			.setDesc("Port number of the proxy server")
 			.addText((text) =>
 				text
-					.setPlaceholder("e.g. 8080")
+					.setPlaceholder("e.g. 47866")
 					.setValue(this.entry.port)
 					.onChange((val) => {
 						this.entry.port = val.trim();
@@ -833,7 +894,7 @@ class ProxyEditModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Username")
-			.setDesc("Leave empty if not required")
+			.setDesc("Leave empty if proxy does not require authentication")
 			.addText((text) =>
 				text
 					.setPlaceholder("optional")
@@ -845,7 +906,7 @@ class ProxyEditModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Password")
-			.setDesc("Leave empty if not required")
+			.setDesc("Leave empty if proxy does not require authentication")
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text
