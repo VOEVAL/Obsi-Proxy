@@ -40,23 +40,27 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
+    this.sessionWatchInterval = null;
+    this.originalEnv = /* @__PURE__ */ new Map();
+    this.lastSessionCount = 0;
   }
   async onload() {
     await this.loadSettings();
     this.addSettingTab(new ObsiProxySettingTab(this.app, this));
     if (this.settings.enabled && this.getActiveProxy()) {
       await this.applyProxy();
+      this.startSessionWatch();
     }
   }
   async onunload() {
+    this.stopSessionWatch();
     await this.clearProxy();
   }
   async loadSettings() {
     const loaded = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
-    if (!this.settings.proxies) {
+    if (!this.settings.proxies)
       this.settings.proxies = [];
-    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -69,11 +73,115 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
       (p) => p.id === this.settings.activeProxyId
     )) != null ? _a : null;
   }
+  // ──────────────────────────────────────────────────────────
+  //  SESSION DISCOVERY
+  // ──────────────────────────────────────────────────────────
   /**
-   * Build a Chromium-compatible proxyRules string from a ProxyEntry.
+   * Get the Electron remote module through any available method.
+   * In Electron 17+, electron.remote was removed and replaced
+   * by the @electron/remote package. Obsidian may or may not
+   * have it available, so we try both.
+   */
+  getRemote() {
+    try {
+      const electron = window.require("electron");
+      if (electron.remote)
+        return electron.remote;
+    } catch (e) {
+    }
+    try {
+      const remote = window.require("@electron/remote");
+      if (remote)
+        return remote;
+    } catch (e) {
+    }
+    return null;
+  }
+  /**
+   * Discover ALL Electron sessions in the current Obsidian instance.
    *
-   * Chromium docs:
+   * This is critical for complete coverage. A single call to
+   * session.defaultSession.setProxy() is NOT sufficient because:
+   *
+   *   - Obsidian may use separate partitions for Sync, plugin
+   *     downloads, webviews, etc.
+   *   - Each BrowserWindow has its own webContents with its own session.
+   *   - New windows created by plugins get new sessions that
+   *     don't inherit defaultSession's proxy settings.
+   *
+   * We cast everything to `any` because the Electron API surface
+   * varies between versions and we need maximum compatibility.
+   */
+  async getAllSessions() {
+    var _a, _b, _c, _d, _e, _f;
+    const sessions = [];
+    const seen = /* @__PURE__ */ new Set();
+    const add = (s) => {
+      if (s && typeof s.setProxy === "function" && !seen.has(s)) {
+        seen.add(s);
+        sessions.push(s);
+      }
+    };
+    try {
+      const electron = window.require("electron");
+      const remote = this.getRemote();
+      if (remote) {
+        try {
+          add((_a = remote.session) == null ? void 0 : _a.defaultSession);
+        } catch (e) {
+        }
+        try {
+          const win = remote.getCurrentWindow();
+          add((_b = win == null ? void 0 : win.webContents) == null ? void 0 : _b.session);
+        } catch (e) {
+        }
+        try {
+          const windows = remote.BrowserWindow.getAllWindows();
+          for (const win of windows) {
+            try {
+              add((_c = win.webContents) == null ? void 0 : _c.session);
+            } catch (e) {
+            }
+          }
+        } catch (e) {
+        }
+        const partitions = [
+          "persist:obsidian",
+          "persist:sync",
+          "persist:plugins",
+          "persist:themes",
+          "persist:core",
+          "persist:0",
+          "persist:1",
+          "persist:"
+        ];
+        for (const partition of partitions) {
+          try {
+            add((_e = (_d = remote.session) == null ? void 0 : _d.fromPartition) == null ? void 0 : _e.call(_d, partition));
+          } catch (e) {
+          }
+        }
+      }
+      try {
+        add((_f = electron.session) == null ? void 0 : _f.defaultSession);
+      } catch (e) {
+      }
+    } catch (e) {
+    }
+    this.lastSessionCount = sessions.length;
+    return sessions;
+  }
+  // ──────────────────────────────────────────────────────────
+  //  PROXY RULES BUILDER
+  // ──────────────────────────────────────────────────────────
+  /**
+   * Build Chromium-compatible proxyRules string.
+   *
+   * Chromium proxy configuration format:
    *   https://www.chromium.org/developers/design-documents/network-settings/
+   *
+   * HTTP:  "http=user:pass@host:port;https=user:pass@host:port"
+   * SOCKS5: "socks5://user:pass@host:port"
    */
   buildProxyRules(proxy) {
     const { proxyType, host, port, username, password } = proxy;
@@ -86,34 +194,93 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
     return `http=${auth}${host}:${port};https=${auth}${host}:${port}`;
   }
   /**
-   * Get the Electron session object.
-   *
-   * Obsidian gives us access to Electron via:
-   *   (window as any).require('electron')
-   *
-   * We need defaultSession from either remote.session
-   * or directly from electron.session (depends on
-   * Electron version and contextIsolation settings).
+   * Build a standard proxy URL for environment variables.
+   * Format: "http://user:pass@host:port" or "socks5://user:pass@host:port"
    */
-  getSession() {
-    var _a, _b, _c, _d, _e;
-    try {
-      const electron = window.require("electron");
-      return (_e = (_d = (_b = (_a = electron.remote) == null ? void 0 : _a.session) == null ? void 0 : _b.defaultSession) != null ? _d : (_c = electron.session) == null ? void 0 : _c.defaultSession) != null ? _e : null;
-    } catch (e) {
-      return null;
+  buildProxyUrl(proxy) {
+    const auth = proxy.username && proxy.password ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@` : "";
+    if (proxy.proxyType === "socks5") {
+      return `socks5://${auth}${proxy.host}:${proxy.port}`;
     }
+    return `http://${auth}${proxy.host}:${proxy.port}`;
+  }
+  // ──────────────────────────────────────────────────────────
+  //  ENVIRONMENT VARIABLES
+  // ──────────────────────────────────────────────────────────
+  /**
+   * Set process.env proxy variables.
+   *
+   * Many Node.js HTTP libraries (axios, node-fetch, got, request)
+   * read HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from environment.
+   * The Node.js built-in http/https modules do NOT read these,
+   * but setting them covers a significant portion of real-world usage.
+   *
+   * We also set lowercase variants (http_proxy) because some
+   * tools only check the lowercase version.
+   */
+  setEnvironmentProxy(proxy) {
+    const httpUrl = `http://${proxy.username && proxy.password ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@` : ""}${proxy.host}:${proxy.port}`;
+    const allUrl = this.buildProxyUrl(proxy);
+    const keys = [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy"
+    ];
+    for (const key of keys) {
+      if (!this.originalEnv.has(key)) {
+        this.originalEnv.set(key, process.env[key]);
+      }
+    }
+    process.env.HTTP_PROXY = httpUrl;
+    process.env.HTTPS_PROXY = httpUrl;
+    process.env.ALL_PROXY = allUrl;
+    process.env.http_proxy = httpUrl;
+    process.env.https_proxy = httpUrl;
+    process.env.all_proxy = allUrl;
   }
   /**
-   * Apply proxy rules to the Electron session.
+   * Restore original environment variables.
+   */
+  clearEnvironmentProxy() {
+    const keys = [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy"
+    ];
+    for (const key of keys) {
+      const original = this.originalEnv.get(key);
+      if (original === void 0) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original;
+      }
+    }
+    this.originalEnv.clear();
+  }
+  // ──────────────────────────────────────────────────────────
+  //  PROXY APPLY / CLEAR
+  // ──────────────────────────────────────────────────────────
+  /**
+   * Apply proxy to ALL discovered sessions + environment variables.
    *
-   * This is the core call that makes ALL Obsidian + plugin traffic
-   * go through the proxy. After this call, every new HTTP/HTTPS/TCP
-   * connection from the renderer process will be routed through the
-   * specified proxy server.
+   * This is the core method that ensures complete traffic coverage.
+   * It applies the proxy at two levels:
+   *
+   *   1) session.setProxy() — Chromium network stack
+   *      Covers: fetch, XHR, requestUrl(), electron.net,
+   *              webviews, plugin API calls, Obsidian Sync
+   *
+   *   2) process.env — Node.js network stack fallback
+   *      Covers: axios, node-fetch, got, and any library
+   *              that reads HTTP_PROXY/HTTPS_PROXY
    */
   async applyProxy() {
-    var _a;
     const proxy = this.getActiveProxy();
     if (!proxy) {
       new import_obsidian.Notice("Obsi Proxy: no proxy selected");
@@ -124,93 +291,162 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("Obsi Proxy: host and port are required");
       return false;
     }
-    const session = this.getSession();
-    if (!session) {
-      new import_obsidian.Notice("Obsi Proxy: cannot access Electron session");
+    const sessions = await this.getAllSessions();
+    let applied = 0;
+    for (const session of sessions) {
+      try {
+        await session.setProxy({
+          mode: "fixed_servers",
+          proxyRules: rules,
+          proxyBypassRules: ""
+        });
+        applied++;
+      } catch (err) {
+        console.error("Obsi Proxy: setProxy failed on session", err);
+      }
+    }
+    this.setEnvironmentProxy(proxy);
+    if (applied === 0) {
+      new import_obsidian.Notice(
+        "Obsi Proxy: could not apply proxy to any Electron session. Check Electron API access."
+      );
       return false;
     }
-    try {
-      await session.setProxy({
-        proxyRules: rules,
-        proxyBypassRules: ""
-      });
-      new import_obsidian.Notice(
-        `Obsi Proxy: ON \u2014 ${proxy.name} (${proxy.proxyType}://${proxy.host}:${proxy.port})`
-      );
-      return true;
-    } catch (err) {
-      console.error("Obsi Proxy apply error:", err);
-      new import_obsidian.Notice(
-        `Obsi Proxy: error \u2014 ${(_a = err.message) != null ? _a : err}`
-      );
-      return false;
+    let verified = false;
+    for (const session of sessions) {
+      try {
+        const resolved = await session.resolveProxy(
+          "https://example.com"
+        );
+        if (resolved && resolved !== "DIRECT") {
+          verified = true;
+          break;
+        }
+      } catch (e) {
+      }
     }
+    if (!verified && applied > 0) {
+      console.warn(
+        "Obsi Proxy: setProxy was called but resolveProxy returns DIRECT \u2014 proxy may not have taken effect"
+      );
+    }
+    console.log(
+      `Obsi Proxy: applied to ${applied}/${sessions.length} sessions, env vars set, verified=${verified}`
+    );
+    new import_obsidian.Notice(
+      `Obsi Proxy: ON \u2014 ${proxy.name} (${applied} sessions, env vars set)`
+    );
+    return true;
   }
   /**
-   * Clear proxy rules — all traffic returns to direct connection.
+   * Clear proxy from ALL sessions + restore environment variables.
    */
   async clearProxy() {
-    const session = this.getSession();
-    if (!session)
-      return;
-    try {
-      await session.setProxy({
-        proxyRules: "",
-        proxyBypassRules: ""
-      });
-    } catch (err) {
-      console.error("Obsi Proxy clear error:", err);
+    const sessions = await this.getAllSessions();
+    for (const session of sessions) {
+      try {
+        await session.setProxy({
+          mode: "system",
+          proxyRules: "",
+          proxyBypassRules: ""
+        });
+      } catch (err) {
+        console.error("Obsi Proxy: clearProxy failed on session", err);
+      }
     }
+    this.clearEnvironmentProxy();
   }
   async enableProxy() {
     const ok = await this.applyProxy();
     this.settings.enabled = ok;
     await this.saveSettings();
+    if (ok) {
+      this.startSessionWatch();
+    }
   }
   async disableProxy() {
+    this.stopSessionWatch();
     await this.clearProxy();
     this.settings.enabled = false;
     await this.saveSettings();
     new import_obsidian.Notice("Obsi Proxy: OFF \u2014 direct connection restored");
   }
+  // ──────────────────────────────────────────────────────────
+  //  PERIODIC SESSION REFRESH
+  // ──────────────────────────────────────────────────────────
   /**
-   * Apply a specific proxy (by entry) to the session.
-   * Used for temporarily checking a proxy that isn't currently active.
+   * Periodically re-apply proxy to all sessions.
+   *
+   * This handles the case where new BrowserWindows or webviews
+   * are created AFTER the proxy was enabled. These new sessions
+   * don't inherit the proxy settings from defaultSession.
+   *
+   * Interval: 30 seconds (low overhead, catches new windows quickly).
    */
-  async applySpecificProxy(proxy) {
-    const rules = this.buildProxyRules(proxy);
-    if (!rules)
-      return false;
-    const session = this.getSession();
-    if (!session)
-      return false;
-    try {
-      await session.setProxy({
-        proxyRules: rules,
-        proxyBypassRules: ""
-      });
-      return true;
-    } catch (e) {
-      return false;
+  startSessionWatch() {
+    if (this.sessionWatchInterval)
+      return;
+    this.sessionWatchInterval = window.setInterval(async () => {
+      if (!this.settings.enabled || !this.getActiveProxy())
+        return;
+      const proxy = this.getActiveProxy();
+      const rules = this.buildProxyRules(proxy);
+      if (!rules)
+        return;
+      const sessions = await this.getAllSessions();
+      for (const session of sessions) {
+        try {
+          await session.setProxy({
+            mode: "fixed_servers",
+            proxyRules: rules,
+            proxyBypassRules: ""
+          });
+        } catch (e) {
+        }
+      }
+    }, 3e4);
+  }
+  stopSessionWatch() {
+    if (this.sessionWatchInterval !== null) {
+      window.clearInterval(this.sessionWatchInterval);
+      this.sessionWatchInterval = null;
     }
   }
+  // ──────────────────────────────────────────────────────────
+  //  CONNECTION CHECK
+  // ──────────────────────────────────────────────────────────
   /**
-   * Connection check.
+   * Check if a proxy works by making a test request through it.
    *
-   * If proxy is enabled and this is the active proxy — just check directly.
-   * If proxy is NOT enabled — temporarily apply the proxy, check, then
-   * revert to the previous state (either direct or previous active proxy).
+   * Works regardless of whether the proxy is currently active:
    *
-   * This ensures the checker works regardless of whether the proxy
-   * is currently connected or not.
+   *   - If the proxy IS active: just make the test request directly.
+   *   - If the proxy is NOT active: temporarily apply it to ALL
+   *     sessions + env vars, make the test request, then revert
+   *     to the previous state.
+   *
+   * This ensures the checker is useful for pre-flight testing
+   * before committing to a proxy.
    */
   async checkConnection(proxy) {
     const isActive = this.settings.enabled && this.settings.activeProxyId === proxy.id;
     let needsRevert = false;
     if (!isActive) {
-      const applied = await this.applySpecificProxy(proxy);
-      if (!applied)
+      const rules = this.buildProxyRules(proxy);
+      if (!rules)
         return null;
+      const sessions = await this.getAllSessions();
+      for (const session of sessions) {
+        try {
+          await session.setProxy({
+            mode: "fixed_servers",
+            proxyRules: rules,
+            proxyBypassRules: ""
+          });
+        } catch (e) {
+        }
+      }
+      this.setEnvironmentProxy(proxy);
       needsRevert = true;
     }
     try {
@@ -225,12 +461,101 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
     } finally {
       if (needsRevert) {
         if (this.settings.enabled && this.getActiveProxy()) {
-          await this.applyProxy();
+          const activeProxy = this.getActiveProxy();
+          const rules = this.buildProxyRules(activeProxy);
+          const sessions = await this.getAllSessions();
+          for (const session of sessions) {
+            try {
+              await session.setProxy({
+                mode: "fixed_servers",
+                proxyRules: rules,
+                proxyBypassRules: ""
+              });
+            } catch (e) {
+            }
+          }
+          this.setEnvironmentProxy(activeProxy);
         } else {
-          await this.clearProxy();
+          const sessions = await this.getAllSessions();
+          for (const session of sessions) {
+            try {
+              await session.setProxy({
+                mode: "system",
+                proxyRules: "",
+                proxyBypassRules: ""
+              });
+            } catch (e) {
+            }
+          }
+          this.clearEnvironmentProxy();
         }
       }
     }
+  }
+  // ──────────────────────────────────────────────────────────
+  //  DIAGNOSTICS
+  // ──────────────────────────────────────────────────────────
+  /**
+   * Collect diagnostic information about the current proxy state.
+   * Useful for debugging and user support.
+   */
+  async getDiagnostics() {
+    const lines = [];
+    lines.push("=== Obsi Proxy Diagnostics ===");
+    lines.push("");
+    const hasRequire = typeof window.require === "function";
+    lines.push(`window.require available: ${hasRequire}`);
+    if (hasRequire) {
+      try {
+        const electron = window.require("electron");
+        lines.push(`electron.remote available: ${!!electron.remote}`);
+        try {
+          const remote = window.require("@electron/remote");
+          lines.push(`@electron/remote available: ${!!remote}`);
+        } catch (e) {
+          lines.push("@electron/remote available: false");
+        }
+      } catch (e) {
+        lines.push("electron require failed");
+      }
+    }
+    const sessions = await this.getAllSessions();
+    lines.push(`Sessions discovered: ${sessions.length}`);
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i];
+      try {
+        const resolved = await session.resolveProxy(
+          "https://example.com"
+        );
+        lines.push(`  Session ${i}: resolveProxy = "${resolved}"`);
+      } catch (err) {
+        lines.push(`  Session ${i}: resolveProxy failed \u2014 ${err}`);
+      }
+    }
+    lines.push("");
+    lines.push("Environment variables:");
+    for (const key of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy"
+    ]) {
+      const val = process.env[key];
+      if (val) {
+        const masked = val.replace(/:[^@]+@/, ":****@");
+        lines.push(`  ${key} = ${masked}`);
+      } else {
+        lines.push(`  ${key} = (not set)`);
+      }
+    }
+    lines.push("");
+    lines.push(`Proxy enabled: ${this.settings.enabled}`);
+    lines.push(`Active proxy ID: ${this.settings.activeProxyId || "(none)"}`);
+    lines.push(`Saved proxies: ${this.settings.proxies.length}`);
+    lines.push(`Session watch active: ${this.sessionWatchInterval !== null}`);
+    return lines.join("\n");
   }
 };
 var ProxyCheckModal = class extends import_obsidian.Modal {
@@ -244,7 +569,6 @@ var ProxyCheckModal = class extends import_obsidian.Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("obsi-proxy-check-modal");
     contentEl.createEl("h2", { text: "Proxy Connection Check" });
     contentEl.createEl("p", {
       text: `Checking: ${this.proxyName}`,
@@ -252,8 +576,10 @@ var ProxyCheckModal = class extends import_obsidian.Modal {
     });
     if (!this.wasActiveWhenChecked) {
       contentEl.createEl("p", {
-        text: "Note: Proxy was not active. It was temporarily applied for this check and then reverted.",
-        attr: { style: "font-style: italic; color: var(--text-muted);" }
+        text: "Note: This proxy was temporarily applied for the check and then reverted to your previous state.",
+        attr: {
+          style: "font-style: italic; color: var(--text-muted);"
+        }
       });
     }
     if (this.error) {
@@ -265,7 +591,7 @@ var ProxyCheckModal = class extends import_obsidian.Modal {
         }
       });
       contentEl.createEl("p", {
-        text: "The proxy server is unreachable or the credentials are incorrect. You can try another proxy or hit Emergency Disable."
+        text: "The proxy server is unreachable or the credentials are incorrect. Try another proxy or hit Emergency Disable."
       });
     } else if (this.result) {
       contentEl.createEl("p", {
@@ -275,15 +601,9 @@ var ProxyCheckModal = class extends import_obsidian.Modal {
           style: "background: var(--background-modifier-success); color: var(--text-success); font-size: 16px; font-weight: 600;"
         }
       });
-      if (this.wasActiveWhenChecked) {
-        contentEl.createEl("p", {
-          text: "This IP belongs to your proxy server. Connection is working correctly."
-        });
-      } else {
-        contentEl.createEl("p", {
-          text: "This is the IP that would be seen if you enable this proxy. Connection is working correctly."
-        });
-      }
+      contentEl.createEl("p", {
+        text: this.wasActiveWhenChecked ? "This IP belongs to your proxy server. Connection is working correctly." : "This is the IP that would be seen if you enable this proxy. Connection is working correctly."
+      });
     }
     new import_obsidian.Setting(contentEl).addButton(
       (btn) => btn.setButtonText("Close").onClick(() => this.close())
@@ -307,42 +627,38 @@ var ProxyEditModal = class extends import_obsidian.Modal {
     contentEl.createEl("h2", {
       text: this.isNew ? "Add Proxy" : "Edit Proxy"
     });
-    new import_obsidian.Setting(contentEl).setName("Name").setDesc("A friendly name for this proxy").addText((text) => {
-      text.setPlaceholder("e.g. Work VPN").setValue(this.entry.name).onChange((val) => {
+    new import_obsidian.Setting(contentEl).setName("Name").setDesc("A friendly name for this proxy").addText(
+      (text) => text.setPlaceholder("e.g. Work VPN").setValue(this.entry.name).onChange((val) => {
         this.entry.name = val;
-      });
-      this.nameInput = text.inputEl;
-    });
-    new import_obsidian.Setting(contentEl).setName("Proxy type").setDesc("HTTP routes HTTP/HTTPS. SOCKS5 proxies all TCP with DNS on the proxy side.").addDropdown((dd) => {
-      dd.addOption("http", "HTTP").addOption("socks5", "SOCKS5").setValue(this.entry.proxyType).onChange((val) => {
+      })
+    );
+    new import_obsidian.Setting(contentEl).setName("Proxy type").setDesc(
+      "HTTP routes HTTP/HTTPS. SOCKS5 proxies all TCP with DNS resolution on the proxy side."
+    ).addDropdown(
+      (dd) => dd.addOption("http", "HTTP").addOption("socks5", "SOCKS5").setValue(this.entry.proxyType).onChange((val) => {
         this.entry.proxyType = val;
-      });
-      this.typeSelect = dd.selectEl;
-    });
-    new import_obsidian.Setting(contentEl).setName("Host").setDesc("IP address or hostname").addText((text) => {
-      text.setPlaceholder("e.g. 127.0.0.1").setValue(this.entry.host).onChange((val) => {
+      })
+    );
+    new import_obsidian.Setting(contentEl).setName("Host").setDesc("IP address or hostname").addText(
+      (text) => text.setPlaceholder("e.g. 127.0.0.1").setValue(this.entry.host).onChange((val) => {
         this.entry.host = val.trim();
-      });
-      this.hostInput = text.inputEl;
-    });
-    new import_obsidian.Setting(contentEl).setName("Port").setDesc("Port number").addText((text) => {
-      text.setPlaceholder("e.g. 8080").setValue(this.entry.port).onChange((val) => {
+      })
+    );
+    new import_obsidian.Setting(contentEl).setName("Port").setDesc("Port number").addText(
+      (text) => text.setPlaceholder("e.g. 8080").setValue(this.entry.port).onChange((val) => {
         this.entry.port = val.trim();
-      });
-      this.portInput = text.inputEl;
-    });
-    new import_obsidian.Setting(contentEl).setName("Username").setDesc("Leave empty if not required").addText((text) => {
-      text.setPlaceholder("optional").setValue(this.entry.username).onChange((val) => {
+      })
+    );
+    new import_obsidian.Setting(contentEl).setName("Username").setDesc("Leave empty if not required").addText(
+      (text) => text.setPlaceholder("optional").setValue(this.entry.username).onChange((val) => {
         this.entry.username = val;
-      });
-      this.usernameInput = text.inputEl;
-    });
+      })
+    );
     new import_obsidian.Setting(contentEl).setName("Password").setDesc("Leave empty if not required").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("optional").setValue(this.entry.password).onChange((val) => {
         this.entry.password = val;
       });
-      this.passwordInput = text.inputEl;
     });
     new import_obsidian.Setting(contentEl).addButton(
       (btn) => btn.setButtonText(this.isNew ? "Add Proxy" : "Save Changes").setCta().onClick(() => {
@@ -356,6 +672,36 @@ var ProxyEditModal = class extends import_obsidian.Modal {
         this.onSave(this.entry);
         this.close();
       })
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var DiagnosticsModal = class extends import_obsidian.Modal {
+  constructor(app, diagText) {
+    super(app);
+    this.diagText = diagText;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Obsi Proxy Diagnostics" });
+    const pre = contentEl.createEl("pre", {
+      cls: "obsi-proxy-check-result",
+      attr: {
+        style: "background: var(--background-secondary); padding: 16px; border-radius: 6px; overflow-x: auto; max-height: 400px; white-space: pre-wrap;"
+      }
+    });
+    pre.textContent = this.diagText;
+    new import_obsidian.Setting(contentEl).addButton(
+      (btn) => btn.setButtonText("Copy to Clipboard").onClick(() => {
+        navigator.clipboard.writeText(this.diagText);
+        new import_obsidian.Notice("Copied to clipboard");
+      })
+    );
+    new import_obsidian.Setting(contentEl).addButton(
+      (btn) => btn.setButtonText("Close").onClick(() => this.close())
     );
   }
   onClose() {
@@ -378,6 +724,7 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
     this.renderToggle(containerEl);
     this.renderProxyList(containerEl);
     this.renderEmergency(containerEl);
+    this.renderDiagnostics(containerEl);
   }
   renderStatus(parent) {
     const active = this.plugin.getActiveProxy();
@@ -388,7 +735,9 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
     });
   }
   renderToggle(parent) {
-    new import_obsidian.Setting(parent).setName("Enable proxy").setDesc("Route all Obsidian and plugin traffic through the selected proxy").addToggle(
+    new import_obsidian.Setting(parent).setName("Enable proxy").setDesc(
+      "Route all Obsidian and plugin traffic through the selected proxy"
+    ).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enabled).onChange(async (val) => {
         if (val) {
           if (!this.plugin.getActiveProxy()) {
@@ -400,7 +749,7 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
         } else {
           await this.plugin.disableProxy();
         }
-        this.refreshStatus();
+        this.display();
       })
     );
   }
@@ -470,7 +819,7 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
       cls: "obsi-proxy-list-item-header"
     });
     header.createEl("span", {
-      text: isSelected ? `> ${proxy.name}` : proxy.name,
+      text: isSelected ? `\u25B6 ${proxy.name}` : proxy.name,
       cls: "obsi-proxy-list-item-name"
     });
     const actions = header.createEl("div", {
@@ -533,9 +882,7 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
     });
     delBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      this.plugin.settings.proxies = this.plugin.settings.proxies.filter(
-        (p) => p.id !== proxy.id
-      );
+      this.plugin.settings.proxies = this.plugin.settings.proxies.filter((p) => p.id !== proxy.id);
       if (this.plugin.settings.activeProxyId === proxy.id) {
         this.plugin.settings.activeProxyId = this.plugin.settings.proxies.length > 0 ? this.plugin.settings.proxies[0].id : "";
         if (this.plugin.settings.enabled) {
@@ -561,6 +908,25 @@ var ObsiProxySettingTab = class extends import_obsidian.PluginSettingTab {
       (btn) => btn.setButtonText("Disable Proxy Now").setWarning().onClick(async () => {
         await this.plugin.disableProxy();
         this.display();
+      })
+    );
+  }
+  renderDiagnostics(parent) {
+    parent.createEl("div", {
+      text: "DIAGNOSTICS",
+      cls: "obsi-proxy-section-title"
+    });
+    new import_obsidian.Setting(parent).setName("Run diagnostics").setDesc(
+      "Check Electron session access, proxy state, and environment variables"
+    ).addButton(
+      (btn) => btn.setButtonText("Run Diagnostics").onClick(async () => {
+        btn.setButtonText("Running...");
+        btn.setDisabled(true);
+        const diag = await this.plugin.getDiagnostics();
+        btn.setButtonText("Run Diagnostics");
+        btn.setDisabled(false);
+        const modal = new DiagnosticsModal(this.app, diag);
+        modal.open();
       })
     );
   }
