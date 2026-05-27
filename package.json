@@ -1,13 +1,13 @@
 {
 	"name": "obsi-proxy",
-	"version": "1.0.0",
-	"description": "Obsidian plugin for global proxy routing",
+	"version": "2.0.0",
+	"description": "Convenient proxy configuration for Obsidian — multi-proxy support with connection checker",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
 	},
-	"keywords": ["obsidian", "proxy", "socks5", "http-proxy", "electron"],
+	"keywords": ["obsidian", "proxy", "socks5", "http-proxy", "electron", "multi-proxy"],
 	"author": "VOEVAL",
 	"license": "MIT",
 	"devDependencies": {

@@ -1,25 +1,81 @@
-.global-proxy-settings .setting-item-description {
+.obsi-proxy-settings .setting-item-description {
 	white-space: pre-line;
 }
 
-.global-proxy-status {
-	padding: 6px 12px;
-	border-radius: 4px;
-	margin-bottom: 12px;
+.obsi-proxy-status {
+	padding: 8px 14px;
+	border-radius: 6px;
+	margin-bottom: 16px;
 	font-size: 14px;
+	font-weight: 500;
 }
 
-.global-proxy-status.active {
+.obsi-proxy-status.active {
 	background-color: var(--background-modifier-success);
 	color: var(--text-success);
 }
 
-.global-proxy-status.inactive {
+.obsi-proxy-status.inactive {
 	background-color: var(--background-modifier-error);
 	color: var(--text-error);
 }
 
-.global-proxy-check-result {
+.obsi-proxy-list-item {
+	padding: 10px 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	margin-bottom: 8px;
+	cursor: pointer;
+	transition: border-color 0.2s, background-color 0.2s;
+}
+
+.obsi-proxy-list-item:hover {
+	border-color: var(--interactive-accent);
+}
+
+.obsi-proxy-list-item.selected {
+	border-color: var(--interactive-accent);
+	background-color: var(--background-modifier-hover);
+}
+
+.obsi-proxy-list-item-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 4px;
+}
+
+.obsi-proxy-list-item-name {
+	font-weight: 600;
+	font-size: 14px;
+}
+
+.obsi-proxy-list-item-detail {
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.obsi-proxy-list-item-actions {
+	display: flex;
+	gap: 4px;
+}
+
+.obsi-proxy-list-item-actions button {
+	font-size: 11px;
+	padding: 2px 8px;
+}
+
+.obsi-proxy-section-title {
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--text-muted);
+	margin-top: 20px;
+	margin-bottom: 8px;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+}
+
+.obsi-proxy-check-result {
 	padding: 8px 12px;
 	border-radius: 4px;
 	margin-top: 8px;

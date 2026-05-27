@@ -1,9 +1,9 @@
 {
-	"id": "global-proxy",
-	"name": "Global Proxy",
-	"version": "1.0.0",
+	"id": "obsi-proxy",
+	"name": "Obsi Proxy",
+	"version": "2.0.0",
 	"minAppVersion": "1.0.0",
-	"description": "Routes all Obsidian network traffic through HTTP or SOCKS5 proxy with connection checker.",
+	"description": "Route all Obsidian and plugin traffic through HTTP or SOCKS5 proxies — with multi-proxy support, connection checker, and one-click toggle.",
 	"author": "VOEVAL",
 	"authorUrl": "https://github.com/VOEVAL",
 	"isDesktopOnly": true
