@@ -1,13 +1,20 @@
 {
 	"name": "obsi-proxy",
-	"version": "2.1.0",
+	"version": "2.2.0",
 	"description": "Convenient proxy configuration for Obsidian — multi-proxy support with connection checker",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
 	},
-	"keywords": ["obsidian", "proxy", "socks5", "http-proxy", "electron", "multi-proxy"],
+	"keywords": [
+		"obsidian",
+		"proxy",
+		"socks5",
+		"http-proxy",
+		"electron",
+		"multi-proxy"
+	],
 	"author": "VOEVAL",
 	"license": "MIT",
 	"devDependencies": {
@@ -17,5 +24,9 @@
 		"obsidian": "latest",
 		"tslib": "2.4.0",
 		"typescript": "4.7.4"
+	},
+	"dependencies": {
+		"https-proxy-agent": "^9.0.0",
+		"socks-proxy-agent": "^10.0.0"
 	}
 }
