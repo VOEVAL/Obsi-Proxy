@@ -185,50 +185,46 @@ export default class ObsiProxyPlugin extends Plugin {
 	 * one makes resolveProxy() return a non-DIRECT result.
 	 */
 	buildProxyRulesFormats(proxy: ProxyEntry): string[] {
-		const { host, port, username, password } = proxy;
+		const { host, port } = proxy;
 		if (!host || !port) return [];
 
-		const auth = username && password
-			? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`
-			: "";
+		/**
+		 * Deep test proved: this Chromium version does NOT support
+		 * credentials in proxyRules. Only the bare host:port format
+		 * makes resolveProxy() return non-DIRECT.
+		 *
+		 * Auth MUST go through session.on('login') handler instead.
+		 *
+		 * We still try credential formats as fallback for other
+		 * Chromium versions, but put the working format first.
+		 */
 
 		if (proxy.proxyType === "socks5") {
 			return [
-				`socks5://${auth}${host}:${port}`,
+				// Format 1 (best): no creds — works on ALL Chromium versions
+				`socks5://${host}:${port}`,
+				// Format 2: with creds — may work on newer Chromium
+				...(proxy.username && proxy.password
+					? [`socks5://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${host}:${port}`]
+					: []),
 			];
 		}
 
-		// HTTP proxy — try multiple formats
 		const formats: string[] = [];
 
-		// Format 1: traffic-type + full URL with scheme (most explicit)
-		if (username && password) {
-			formats.push(
-				`http=http://${auth}${host}:${port};https=http://${auth}${host}:${port}`
-			);
-		} else {
-			formats.push(
-				`http=${host}:${port};https=${host}:${port}`
-			);
-		}
+		// Format 1 (best): traffic-type + host:port, NO credentials
+		// This is the ONLY format that works on most Electron versions
+		formats.push(`http=${host}:${port};https=${host}:${port}`);
 
-		// Format 2: single URL without traffic-type prefix
-		// Chromium uses this proxy for ALL protocols
-		if (username && password) {
-			formats.push(
-				`http://${auth}${host}:${port}`
-			);
-		} else {
-			formats.push(
-				`${host}:${port}`
-			);
-		}
+		// Format 2: single host:port without traffic-type
+		formats.push(`${host}:${port}`);
 
-		// Format 3: separate entries without auth in URL
-		// (for when auth goes through on('login') handler only)
-		formats.push(
-			`http=${host}:${port};https=${host}:${port}`
-		);
+		// Format 3: with creds in URL (may work on some Chromium versions)
+		if (proxy.username && proxy.password) {
+			const auth = `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`;
+			formats.push(`http=http://${auth}${host}:${port};https=http://${auth}${host}:${port}`);
+			formats.push(`http://${auth}${host}:${port}`);
+		}
 
 		return formats;
 	}

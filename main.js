@@ -5286,37 +5286,25 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
    * one makes resolveProxy() return a non-DIRECT result.
    */
   buildProxyRulesFormats(proxy) {
-    const { host, port, username, password } = proxy;
+    const { host, port } = proxy;
     if (!host || !port)
       return [];
-    const auth = username && password ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : "";
     if (proxy.proxyType === "socks5") {
       return [
-        `socks5://${auth}${host}:${port}`
+        // Format 1 (best): no creds — works on ALL Chromium versions
+        `socks5://${host}:${port}`,
+        // Format 2: with creds — may work on newer Chromium
+        ...proxy.username && proxy.password ? [`socks5://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${host}:${port}`] : []
       ];
     }
     const formats = [];
-    if (username && password) {
-      formats.push(
-        `http=http://${auth}${host}:${port};https=http://${auth}${host}:${port}`
-      );
-    } else {
-      formats.push(
-        `http=${host}:${port};https=${host}:${port}`
-      );
+    formats.push(`http=${host}:${port};https=${host}:${port}`);
+    formats.push(`${host}:${port}`);
+    if (proxy.username && proxy.password) {
+      const auth = `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`;
+      formats.push(`http=http://${auth}${host}:${port};https=http://${auth}${host}:${port}`);
+      formats.push(`http://${auth}${host}:${port}`);
     }
-    if (username && password) {
-      formats.push(
-        `http://${auth}${host}:${port}`
-      );
-    } else {
-      formats.push(
-        `${host}:${port}`
-      );
-    }
-    formats.push(
-      `http=${host}:${port};https=${host}:${port}`
-    );
     return formats;
   }
   buildProxyUrl(proxy) {
