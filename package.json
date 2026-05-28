@@ -1,6 +1,6 @@
 {
 	"name": "obsi-proxy",
-	"version": "2.2.0",
+	"version": "2.3.0",
 	"description": "Convenient proxy configuration for Obsidian — multi-proxy support with connection checker",
 	"main": "main.js",
 	"scripts": {
