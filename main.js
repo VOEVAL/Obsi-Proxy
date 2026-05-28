@@ -5318,8 +5318,15 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
   //  LOGIN HANDLER
   // ──────────────────────────────────────────────────────────
   createLoginHandler(proxy) {
-    return (event, _w, _r, authInfo, callback) => {
-      if (authInfo?.isProxy && proxy.username && proxy.password) {
+    return (event, webContents, request, authInfo, callback) => {
+      console.log("Obsi Proxy: login event fired", {
+        isProxy: authInfo?.isProxy,
+        scheme: authInfo?.scheme,
+        host: authInfo?.host,
+        port: authInfo?.port,
+        realm: authInfo?.realm
+      });
+      if (proxy.username && proxy.password) {
         event.preventDefault();
         callback(proxy.username, proxy.password);
       }
@@ -5335,6 +5342,27 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
       } catch {
       }
     }
+    const remote = this.getRemote();
+    if (remote) {
+      try {
+        const windows = remote.BrowserWindow.getAllWindows();
+        for (const win of windows) {
+          try {
+            win.webContents?.on("login", this.loginHandler);
+          } catch {
+          }
+        }
+      } catch {
+      }
+      try {
+        const win = remote.getCurrentWindow();
+        try {
+          win?.webContents?.on("login", this.loginHandler);
+        } catch {
+        }
+      } catch {
+      }
+    }
   }
   async unregisterLoginHandlers() {
     if (!this.loginHandler)
@@ -5343,6 +5371,27 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
     for (const s of sessions) {
       try {
         s.removeListener("login", this.loginHandler);
+      } catch {
+      }
+    }
+    const remote = this.getRemote();
+    if (remote) {
+      try {
+        const windows = remote.BrowserWindow.getAllWindows();
+        for (const win of windows) {
+          try {
+            win.webContents?.removeListener("login", this.loginHandler);
+          } catch {
+          }
+        }
+      } catch {
+      }
+      try {
+        const win = remote.getCurrentWindow();
+        try {
+          win?.webContents?.removeListener("login", this.loginHandler);
+        } catch {
+        }
       } catch {
       }
     }
@@ -5696,6 +5745,80 @@ var ObsiProxyPlugin = class extends import_obsidian.Plugin {
     lines.push(`Session watch active: ${this.sessionWatchInterval !== null}`);
     lines.push(`Login handler registered: ${this.loginHandler !== null}`);
     lines.push(`Last apply log: ${this.lastApplyLog || "(none)"}`);
+    lines.push("");
+    lines.push("=== Real Connectivity Test ===");
+    const activeProxy = this.getActiveProxy();
+    if (activeProxy) {
+      lines.push("");
+      lines.push("Test 1: Node.js https.request (globalAgent)...");
+      try {
+        const nodeHttps2 = require("https");
+        const testResult = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("timeout 10s")), 1e4);
+          const req = nodeHttps2.get("https://api.ipify.org?format=json", (res) => {
+            let data = "";
+            res.on("data", (chunk) => {
+              data += chunk;
+            });
+            res.on("end", () => {
+              clearTimeout(timeout);
+              resolve(data);
+            });
+          });
+          req.on("error", (err) => {
+            clearTimeout(timeout);
+            reject(err);
+          });
+        });
+        const json = JSON.parse(testResult);
+        lines.push(`  \u2713 Node.js test OK \u2014 outgoing IP: ${json.ip}`);
+      } catch (err) {
+        lines.push(`  \u2717 Node.js test FAILED \u2014 ${err.message ?? err}`);
+      }
+      lines.push("");
+      lines.push("Test 2: Chromium requestUrl (session proxy)...");
+      try {
+        const resp = await (0, import_obsidian.requestUrl)({
+          url: "https://api.ipify.org?format=json",
+          method: "GET"
+        });
+        const json = resp.json;
+        lines.push(`  \u2713 Chromium test OK \u2014 outgoing IP: ${json.ip}`);
+      } catch (err) {
+        lines.push(`  \u2717 Chromium test FAILED \u2014 ${err.message ?? err}`);
+        lines.push(`  (This likely means proxy auth (407) is not being handled)`);
+      }
+      lines.push("");
+      lines.push("Test 3: Direct request (no proxy) for IP comparison...");
+      try {
+        const savedEnabled = this.settings.enabled;
+        const nodeHttp2 = require("http");
+        const nodeHttps2 = require("https");
+        const savedAgent = nodeHttps2.globalAgent;
+        nodeHttps2.globalAgent = this.originalHttpsAgent || new nodeHttps2.Agent();
+        const sessions2 = await this.getAllSessions();
+        for (const s of sessions2) {
+          try {
+            await s.setProxy({ mode: "direct", proxyRules: "", proxyBypassRules: "" });
+          } catch {
+          }
+        }
+        const resp = await (0, import_obsidian.requestUrl)({ url: "https://api.ipify.org?format=json", method: "GET" });
+        const json = resp.json;
+        lines.push(`  \u2713 Direct IP: ${json.ip}`);
+        nodeHttps2.globalAgent = savedAgent;
+        if (savedEnabled && activeProxy) {
+          for (const s of sessions2) {
+            try {
+              await this.setProxyWithVerify(s, activeProxy);
+            } catch {
+            }
+          }
+        }
+      } catch (err) {
+        lines.push(`  \u2717 Direct test FAILED \u2014 ${err.message ?? err}`);
+      }
+    }
     const active = this.getActiveProxy();
     if (active) {
       lines.push("");
